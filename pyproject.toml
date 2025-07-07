@@ -8,6 +8,7 @@ dependencies = [
     "polars>=1.29.0",
     "pydantic>=2.11.4",
     "python-dotenv>=1.1.0",
+    "tqdm>=4.67.1",
 ]
 
 [dependency-groups]

@@ -3,6 +3,7 @@ import os
 from enum import Enum
 from typing import List, Optional
 
+import logfire
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessage
@@ -279,9 +280,12 @@ def check_api_configuration() -> bool:
     Returns:
         bool: True if API key is available, False otherwise
     """
+    logfire.info("Checking OpenAI API configuration")
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key or api_key == "your_openai_api_key_here":
+        logfire.warning("OpenAI API key not configured or using placeholder value")
         return False
+    logfire.info("OpenAI API key found and configured")
     return True
 
 
@@ -333,167 +337,241 @@ async def analyze_article(article_text: str) -> ArticleAnalysis:
     Raises:
         Exception: If OpenAI API key is not configured or analysis fails
     """
-    try:
-        if not check_api_configuration():
-            raise Exception("OpenAI API key not configured.\n" + get_configuration_help())
+    with logfire.span("analyze_article") as span:
+        span.set_attribute("article_length", len(article_text))
+        logfire.info("Starting article analysis", article_length=len(article_text))
         
-        model_name = os.getenv("OPENAI_MODEL", "openai:gpt-4o")
-        
-        # Create a single agent that can handle multiple response types
-        agent = Agent(
-            model=model_name,
-            system_prompt=SYSTEM_PROMPT,
-        )
-        
-        # Create a single usage object to track across all calls
-        total_usage = Usage()
-        
-        # Track message history throughout the conversation
-        message_history: list[ModelMessage] | None = None
-        
-        # Initialize conversation with the article
-        conversation = await agent.run(
-            f"""I will analyze this scientific article about radiology follow-up recommendations in stages. 
+        try:
+            if not check_api_configuration():
+                error_msg = "OpenAI API key not configured.\n" + get_configuration_help()
+                logfire.error("API configuration check failed")
+                raise Exception(error_msg)
             
-            First, please analyze the article and answer these basic questions:
+            model_name = os.getenv("OPENAI_MODEL", "openai:gpt-4o")
+            logfire.info("Using model for analysis", model=model_name)
+            
+            # Create a single agent that can handle multiple response types
+            agent = Agent(
+                model=model_name,
+                system_prompt=SYSTEM_PROMPT,
+                retries=DEFAULT_RETRIES,
+            )
+            
+            # Create a single usage object to track across all calls
+            total_usage = Usage()
+            
+            # Track message history throughout the conversation
+            message_history: list[ModelMessage] | None = None
+            
+            # Initialize conversation with the article
+            logfire.info("Starting basic analysis conversation")
+            conversation = await agent.run(
+                f"""I will analyze this scientific article about radiology follow-up recommendations in stages. 
+                
+                First, please analyze the article and answer these basic questions:
 
-            {BASIC_ANALYSIS_PROMPT}
+                {BASIC_ANALYSIS_PROMPT}
 
-            Article text:
-            {article_text}""",
-            output_type=BasicAnalysis,
-            usage=total_usage
-        )
-        
-        basic_analysis = conversation.output
-        message_history = conversation.all_messages()
-        
-        # Initialize the final analysis with basic results
-        final_analysis = ArticleAnalysis(
-            study_type=basic_analysis.study_type,
-            describes_identification_method=basic_analysis.describes_identification_method,
-            describes_communication_beyond_report=basic_analysis.describes_communication_beyond_report,
-            describes_tracking_system=basic_analysis.describes_tracking_system,
-            describes_completion_determination=basic_analysis.describes_completion_determination,
-            describes_ordering_assistance=basic_analysis.describes_ordering_assistance,
-            describes_outcome_tracking=basic_analysis.describes_outcome_tracking,
-            describes_influencing_factors=basic_analysis.describes_influencing_factors,
-            confidence_score=basic_analysis.confidence_score,
-        )
-        
-        # Continue the conversation for detailed questions (only if relevant)
-        
-        # Get hypothesis details if it's a hypothesis-testing study
-        if basic_analysis.study_type == StudyType.HYPOTHESIS_TESTING:
-            hypothesis_result = await agent.run(
-                HYPOTHESIS_PROMPT,
-                output_type=HypothesisDetails,
-                message_history=message_history,
+                Article text:
+                {article_text}""",
+                output_type=BasicAnalysis,
                 usage=total_usage
             )
-            final_analysis.hypothesis = hypothesis_result.output.hypothesis
-            message_history = hypothesis_result.all_messages()
-        
-        # Get identification method details
-        if basic_analysis.describes_identification_method:
-            identification_result = await agent.run(
-                IDENTIFICATION_METHOD_PROMPT,
-                output_type=IdentificationMethodDetails,
-                message_history=message_history,
-                usage=total_usage
+            
+            basic_analysis = conversation.output
+            message_history = conversation.all_messages()
+            
+            logfire.info("Basic analysis completed", 
+                        study_type=basic_analysis.study_type.value,
+                        confidence_score=basic_analysis.confidence_score,
+                        identifies_method=basic_analysis.describes_identification_method,
+                        has_communication=basic_analysis.describes_communication_beyond_report,
+                        has_tracking=basic_analysis.describes_tracking_system,
+                        has_completion=basic_analysis.describes_completion_determination,
+                        has_ordering=basic_analysis.describes_ordering_assistance,
+                        has_outcomes=basic_analysis.describes_outcome_tracking,
+                        has_factors=basic_analysis.describes_influencing_factors)
+            
+            # Initialize the final analysis with basic results
+            final_analysis = ArticleAnalysis(
+                study_type=basic_analysis.study_type,
+                describes_identification_method=basic_analysis.describes_identification_method,
+                describes_communication_beyond_report=basic_analysis.describes_communication_beyond_report,
+                describes_tracking_system=basic_analysis.describes_tracking_system,
+                describes_completion_determination=basic_analysis.describes_completion_determination,
+                describes_ordering_assistance=basic_analysis.describes_ordering_assistance,
+                describes_outcome_tracking=basic_analysis.describes_outcome_tracking,
+                describes_influencing_factors=basic_analysis.describes_influencing_factors,
+                confidence_score=basic_analysis.confidence_score,
             )
-            final_analysis.identification_approach = identification_result.output.identification_approach
-            final_analysis.specific_finding_focus = identification_result.output.specific_finding_focus
-            final_analysis.performance_described = identification_result.output.performance_described
-            final_analysis.performance_metrics = identification_result.output.performance_metrics
-            message_history = identification_result.all_messages()
+            
+            # Continue the conversation for detailed questions (only if relevant)
+            detailed_analyses_count = 0
         
-        # Get communication details
-        if basic_analysis.describes_communication_beyond_report:
-            communication_result = await agent.run(
-                COMMUNICATION_PROMPT,
-                output_type=CommunicationDetails,
-                message_history=message_history,
-                usage=total_usage
-            )
-            final_analysis.communication_recipients = communication_result.output.communication_recipients
-            final_analysis.communication_methods = communication_result.output.communication_methods
-            final_analysis.communication_timing = communication_result.output.communication_timing
-            message_history = communication_result.all_messages()
-        
-        # Get tracking system details
-        if basic_analysis.describes_tracking_system:
-            tracking_result = await agent.run(
-                TRACKING_SYSTEM_PROMPT,
-                output_type=TrackingSystemDetails,
-                message_history=message_history,
-                usage=total_usage
-            )
-            final_analysis.tracking_entry_method = tracking_result.output.entry_method
-            final_analysis.tracking_system_details = tracking_result.output.system_description
-            message_history = tracking_result.all_messages()
-        
-        # Get completion determination details
-        if basic_analysis.describes_completion_determination:
-            completion_result = await agent.run(
-                COMPLETION_DETERMINATION_PROMPT,
-                output_type=CompletionDeterminationDetails,
-                message_history=message_history,
-                usage=total_usage
-            )
-            final_analysis.completion_monitoring_method = completion_result.output.monitoring_method
-            final_analysis.completion_overdue_actions = completion_result.output.overdue_actions
-            message_history = completion_result.all_messages()
-        
-        # Get ordering assistance details
-        if basic_analysis.describes_ordering_assistance:
-            assistance_result = await agent.run(
-                ORDERING_ASSISTANCE_PROMPT,
-                output_type=OrderingAssistanceDetails,
-                message_history=message_history,
-                usage=total_usage
-            )
-            final_analysis.ordering_assistance_description = assistance_result.output.assistance_description
-            final_analysis.ordering_automation_level = assistance_result.output.automation_level
-            message_history = assistance_result.all_messages()
-        
-        # Get outcome tracking details
-        if basic_analysis.describes_outcome_tracking:
-            outcome_result = await agent.run(
-                OUTCOME_TRACKING_PROMPT,
-                output_type=OutcomeTrackingDetails,
-                message_history=message_history,
-                usage=total_usage
-            )
-            final_analysis.tracked_outcomes = outcome_result.output.tracked_outcomes
-            message_history = outcome_result.all_messages()
-        
-        # Get influencing factors details
-        if basic_analysis.describes_influencing_factors:
-            factors_result = await agent.run(
-                INFLUENCING_FACTORS_PROMPT,
-                output_type=InfluencingFactorsDetails,
-                message_history=message_history,
-                usage=total_usage
-            )
-            final_analysis.influencing_factors_description = factors_result.output.factors_description
-            final_analysis.influencing_factor_metrics = factors_result.output.factor_metrics
-            message_history = factors_result.all_messages()
-        
-        # Store the total usage in the final analysis notes for now
-        if total_usage:
-            usage_summary = f"Total tokens: {getattr(total_usage, 'total_tokens', 'N/A')}"
-            final_analysis.notes = f"Usage: {usage_summary}" + (f" | {final_analysis.notes}" if final_analysis.notes else "")
-        
-        return final_analysis
-        
-    except Exception as e:
-        if "api_key" in str(e).lower():
-            raise Exception(
-                "OpenAI API key not configured. Please set the OPENAI_API_KEY environment variable "
-                "or create a .env file with your API key."
-            ) from e
-        raise
+            # Continue the conversation for detailed questions (only if relevant)
+            detailed_analyses_count = 0
+            
+            # Get hypothesis details if it's a hypothesis-testing study
+            if basic_analysis.study_type == StudyType.HYPOTHESIS_TESTING:
+                logfire.info("Running hypothesis analysis")
+                with logfire.span("hypothesis_analysis"):
+                    hypothesis_result = await agent.run(
+                        HYPOTHESIS_PROMPT,
+                        output_type=HypothesisDetails,
+                        message_history=message_history,
+                        usage=total_usage
+                    )
+                    final_analysis.hypothesis = hypothesis_result.output.hypothesis
+                    message_history = hypothesis_result.all_messages()
+                    detailed_analyses_count += 1
+                    logfire.info("Hypothesis analysis completed", hypothesis=final_analysis.hypothesis)
+            
+            # Get identification method details
+            if basic_analysis.describes_identification_method:
+                logfire.info("Running identification method analysis")
+                with logfire.span("identification_method_analysis"):
+                    identification_result = await agent.run(
+                        IDENTIFICATION_METHOD_PROMPT,
+                        output_type=IdentificationMethodDetails,
+                        message_history=message_history,
+                        usage=total_usage
+                    )
+                    final_analysis.identification_approach = identification_result.output.identification_approach
+                    final_analysis.specific_finding_focus = identification_result.output.specific_finding_focus
+                    final_analysis.performance_described = identification_result.output.performance_described
+                    final_analysis.performance_metrics = identification_result.output.performance_metrics
+                    message_history = identification_result.all_messages()
+                    detailed_analyses_count += 1
+                    logfire.info("Identification method analysis completed", 
+                                approach=final_analysis.identification_approach,
+                                has_performance=final_analysis.performance_described)
+            
+            # Get communication details
+            if basic_analysis.describes_communication_beyond_report:
+                logfire.info("Running communication analysis")
+                with logfire.span("communication_analysis"):
+                    communication_result = await agent.run(
+                        COMMUNICATION_PROMPT,
+                        output_type=CommunicationDetails,
+                        message_history=message_history,
+                        usage=total_usage
+                    )
+                    final_analysis.communication_recipients = communication_result.output.communication_recipients
+                    final_analysis.communication_methods = communication_result.output.communication_methods
+                    final_analysis.communication_timing = communication_result.output.communication_timing
+                    message_history = communication_result.all_messages()
+                    detailed_analyses_count += 1
+                    logfire.info("Communication analysis completed",
+                                recipients=final_analysis.communication_recipients,
+                                methods=final_analysis.communication_methods)
+            
+            # Get tracking system details
+            if basic_analysis.describes_tracking_system:
+                logfire.info("Running tracking system analysis")
+                with logfire.span("tracking_system_analysis"):
+                    tracking_result = await agent.run(
+                        TRACKING_SYSTEM_PROMPT,
+                        output_type=TrackingSystemDetails,
+                        message_history=message_history,
+                        usage=total_usage
+                    )
+                    final_analysis.tracking_entry_method = tracking_result.output.entry_method
+                    final_analysis.tracking_system_details = tracking_result.output.system_description
+                    message_history = tracking_result.all_messages()
+                    detailed_analyses_count += 1
+                    logfire.info("Tracking system analysis completed",
+                                entry_method=final_analysis.tracking_entry_method.value if final_analysis.tracking_entry_method else None)
+            
+            # Get completion determination details
+            if basic_analysis.describes_completion_determination:
+                logfire.info("Running completion determination analysis")
+                with logfire.span("completion_determination_analysis"):
+                    completion_result = await agent.run(
+                        COMPLETION_DETERMINATION_PROMPT,
+                        output_type=CompletionDeterminationDetails,
+                        message_history=message_history,
+                        usage=total_usage
+                    )
+                    final_analysis.completion_monitoring_method = completion_result.output.monitoring_method
+                    final_analysis.completion_overdue_actions = completion_result.output.overdue_actions
+                    message_history = completion_result.all_messages()
+                    detailed_analyses_count += 1
+                    logfire.info("Completion determination analysis completed",
+                                monitoring_method=final_analysis.completion_monitoring_method)
+            
+            # Get ordering assistance details
+            if basic_analysis.describes_ordering_assistance:
+                logfire.info("Running ordering assistance analysis")
+                with logfire.span("ordering_assistance_analysis"):
+                    assistance_result = await agent.run(
+                        ORDERING_ASSISTANCE_PROMPT,
+                        output_type=OrderingAssistanceDetails,
+                        message_history=message_history,
+                        usage=total_usage
+                    )
+                    final_analysis.ordering_assistance_description = assistance_result.output.assistance_description
+                    final_analysis.ordering_automation_level = assistance_result.output.automation_level
+                    message_history = assistance_result.all_messages()
+                    detailed_analyses_count += 1
+                    logfire.info("Ordering assistance analysis completed",
+                                automation_level=final_analysis.ordering_automation_level)
+            
+            # Get outcome tracking details
+            if basic_analysis.describes_outcome_tracking:
+                logfire.info("Running outcome tracking analysis")
+                with logfire.span("outcome_tracking_analysis"):
+                    outcome_result = await agent.run(
+                        OUTCOME_TRACKING_PROMPT,
+                        output_type=OutcomeTrackingDetails,
+                        message_history=message_history,
+                        usage=total_usage
+                    )
+                    final_analysis.tracked_outcomes = outcome_result.output.tracked_outcomes
+                    message_history = outcome_result.all_messages()
+                    detailed_analyses_count += 1
+                    logfire.info("Outcome tracking analysis completed",
+                                outcomes_count=len(final_analysis.tracked_outcomes))
+            
+            # Get influencing factors details
+            if basic_analysis.describes_influencing_factors:
+                logfire.info("Running influencing factors analysis")
+                with logfire.span("influencing_factors_analysis"):
+                    factors_result = await agent.run(
+                        INFLUENCING_FACTORS_PROMPT,
+                        output_type=InfluencingFactorsDetails,
+                        message_history=message_history,
+                        usage=total_usage
+                    )
+                    final_analysis.influencing_factors_description = factors_result.output.factors_description
+                    final_analysis.influencing_factor_metrics = factors_result.output.factor_metrics
+                    message_history = factors_result.all_messages()
+                    detailed_analyses_count += 1
+                    logfire.info("Influencing factors analysis completed",
+                                has_metrics=bool(final_analysis.influencing_factor_metrics))
+            
+            # Store the total usage in the final analysis notes for now
+            if total_usage:
+                usage_summary = f"Total tokens: {getattr(total_usage, 'total_tokens', 'N/A')}"
+                final_analysis.notes = f"Usage: {usage_summary}" + (f" | {final_analysis.notes}" if final_analysis.notes else "")
+                
+                logfire.info("Analysis completed successfully", 
+                            total_tokens=getattr(total_usage, 'total_tokens', 'N/A'),
+                            detailed_analyses=detailed_analyses_count,
+                            confidence_score=final_analysis.confidence_score)
+            
+            span.set_attribute("detailed_analyses_count", detailed_analyses_count)
+            span.set_attribute("final_confidence", final_analysis.confidence_score)
+            
+            return final_analysis
+            
+        except Exception as e:
+            logfire.error("Error during article analysis", error=str(e), error_type=type(e).__name__)
+            if "api_key" in str(e).lower():
+                raise Exception(
+                    "OpenAI API key not configured. Please set the OPENAI_API_KEY environment variable "
+                    "or create a .env file with your API key."
+                ) from e
+            raise
 
 
 async def analyze_article_from_file(file_path: str) -> ArticleAnalysis:
@@ -506,12 +584,31 @@ async def analyze_article_from_file(file_path: str) -> ArticleAnalysis:
     Returns:
         ArticleAnalysis: Structured analysis results
     """
-    with open(file_path, 'r', encoding='utf-8') as f:
-        article_text = f.read()
-    
-    return await analyze_article(article_text)
+    with logfire.span("analyze_article_from_file") as span:
+        span.set_attribute("file_path", file_path)
+        logfire.info("Starting file analysis", file_path=file_path)
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                article_text = f.read()
+            
+            logfire.info("File read successfully", 
+                        file_path=file_path, 
+                        content_length=len(article_text))
+            
+            result = await analyze_article(article_text)
+            logfire.info("File analysis completed successfully", file_path=file_path)
+            return result
+            
+        except FileNotFoundError:
+            logfire.error("File not found", file_path=file_path)
+            raise
+        except Exception as e:
+            logfire.error("Error analyzing file", file_path=file_path, error=str(e))
+            raise
 
-MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", 20))
+MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", 1))
+DEFAULT_RETRIES = int(os.getenv("DEFAULT_RETRIES", 3))
 
 async def batch_analyze_articles(file_paths: List[str]) -> List[tuple[str, ArticleAnalysis]]:
     """
@@ -523,20 +620,38 @@ async def batch_analyze_articles(file_paths: List[str]) -> List[tuple[str, Artic
     Returns:
         List of tuples containing (file_path, analysis_result)
     """
-    async def analyze_single(file_path: str, semaphore: asyncio.Semaphore) -> tuple[str, ArticleAnalysis]:
-        async with semaphore:
-            try:
-                analysis = await analyze_article_from_file(file_path)
-                return (file_path, analysis)
-            except Exception as e:
-                print(f"Error analyzing {file_path}: {e}")
+    with logfire.span("batch_analyze_articles") as span:
+        span.set_attribute("file_count", len(file_paths))
+        logfire.info("Starting batch analysis", file_count=len(file_paths), max_concurrent=MAX_CONCURRENT_REQUESTS)
+        
+        async def analyze_single(file_path: str, semaphore: asyncio.Semaphore) -> tuple[str, ArticleAnalysis]:
+            async with semaphore:
+                with logfire.span("batch_analyze_single", file_path=file_path):
+                    try:
+                        logfire.info("Starting single file analysis in batch", file_path=file_path)
+                        analysis = await analyze_article_from_file(file_path)
+                        logfire.info("Completed single file analysis in batch", file_path=file_path)
+                        return (file_path, analysis)
+                    except Exception as e:
+                        logfire.error("Error analyzing file in batch", file_path=file_path, error=str(e))
+                        print(f"Error analyzing {file_path}: {e}")
+                        raise
+        
+        # Process articles concurrently (be mindful of API rate limits)
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+        tasks = [analyze_single(path, semaphore) for path in file_paths]
+        
+        try:
+            results = await asyncio.gather(*tasks)
+            logfire.info("Batch analysis completed successfully", 
+                        file_count=len(file_paths), 
+                        successful_count=len(results))
+            return results
+        except Exception as e:
+            logfire.error("Batch analysis failed", 
+                         file_count=len(file_paths), 
+                         error=str(e))
             raise
-    
-    # Process articles concurrently (be mindful of API rate limits)
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-    tasks = [analyze_single(path, semaphore) for path in file_paths]
-    results = await asyncio.gather(*tasks)
-    return results
 
 
 def export_analysis_to_dict(analysis: ArticleAnalysis) -> dict:
@@ -548,73 +663,109 @@ def save_batch_results_to_json(results: List[tuple[str, ArticleAnalysis]], outpu
     """Save batch analysis results to a JSON file."""
     import json
     
-    output_data = []
-    for file_path, analysis in results:
-        output_data.append({
-            "file_path": file_path,
-            "analysis": export_analysis_to_dict(analysis)
-        })
-    
-    with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(output_data, f, indent=2, ensure_ascii=False)
+    with logfire.span("save_batch_results_to_json") as span:
+        span.set_attribute("results_count", len(results))
+        span.set_attribute("output_path", output_path)
+        logfire.info("Starting batch results export to JSON", 
+                    results_count=len(results), 
+                    output_path=output_path)
+        
+        try:
+            output_data = []
+            for file_path, analysis in results:
+                output_data.append({
+                    "file_path": file_path,
+                    "analysis": export_analysis_to_dict(analysis)
+                })
+            
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(output_data, f, indent=2, ensure_ascii=False)
+            
+            # Get file size for logging
+            try:
+                import os
+                file_size = os.path.getsize(output_path)
+                logfire.info("Batch results export completed successfully", 
+                            results_count=len(results), 
+                            output_path=output_path,
+                            file_size_bytes=file_size)
+            except Exception:
+                logfire.info("Batch results export completed successfully", 
+                            results_count=len(results), 
+                            output_path=output_path)
+                
+        except Exception as e:
+            logfire.error("Failed to save batch results to JSON", 
+                         results_count=len(results), 
+                         output_path=output_path,
+                         error=str(e))
+            raise
 
 
 def print_analysis_summary(analysis: ArticleAnalysis) -> None:
     """Print a human-readable summary of the analysis results."""
-    print("Article Analysis Summary")
-    print("=" * 50)
-    print(f"Study Type: {analysis.study_type.value}")
-    if analysis.hypothesis:
-        print(f"Hypothesis: {analysis.hypothesis}")
-    
-    print("\nKey Findings:")
-    print(f"  Describes identification method: {analysis.describes_identification_method}")
-    if analysis.identification_approach:
-        print(f"    Approach: {analysis.identification_approach}")
-    if analysis.specific_finding_focus:
-        print(f"    Focus: {analysis.specific_finding_focus}")
-    if analysis.performance_described:
-        print(f"    Performance described: {analysis.performance_described}")
-    if analysis.performance_metrics:
-        print(f"    Metrics: {analysis.performance_metrics}")
-    
-    print(f"  Describes communication beyond report: {analysis.describes_communication_beyond_report}")
-    if analysis.communication_recipients:
-        print(f"    Recipients: {analysis.communication_recipients}")
-    if analysis.communication_methods:
-        print(f"    Methods: {analysis.communication_methods}")
-    if analysis.communication_timing:
-        print(f"    Timing: {analysis.communication_timing}")
-    print(f"  Describes tracking system: {analysis.describes_tracking_system}")
-    if analysis.tracking_entry_method:
-        print(f"    Entry method: {analysis.tracking_entry_method.value}")
-    print(f"  Describes completion determination: {analysis.describes_completion_determination}")
-    if analysis.completion_monitoring_method:
-        print(f"    Monitoring method: {analysis.completion_monitoring_method}")
-    if analysis.completion_overdue_actions:
-        print(f"    Overdue actions: {analysis.completion_overdue_actions}")
-    print(f"  Describes ordering assistance: {analysis.describes_ordering_assistance}")
-    if analysis.ordering_assistance_description:
-        print(f"    Assistance description: {analysis.ordering_assistance_description}")
-    if analysis.ordering_automation_level:
-        print(f"    Automation level: {analysis.ordering_automation_level}")
-    print(f"  Describes outcome tracking: {analysis.describes_outcome_tracking}")
-    if analysis.tracked_outcomes:
-        print(f"    Tracked outcomes: {', '.join(analysis.tracked_outcomes)}")
-    print(f"  Describes influencing factors: {analysis.describes_influencing_factors}")
-    if analysis.influencing_factors_description:
-        print(f"    Factors: {analysis.influencing_factors_description}")
-    if analysis.influencing_factor_metrics:
-        print(f"    Metrics: {analysis.influencing_factor_metrics}")
-    
-    print(f"\nConfidence Score: {analysis.confidence_score:.2f}")
-    if analysis.notes:
-        print(f"Notes: {analysis.notes}")
+    with logfire.span("print_analysis_summary") as span:
+        span.set_attribute("study_type", analysis.study_type.value)
+        span.set_attribute("confidence_score", analysis.confidence_score)
+        logfire.info("Printing analysis summary", 
+                    study_type=analysis.study_type.value,
+                    confidence_score=analysis.confidence_score)
+        
+        print("Article Analysis Summary")
+        print("=" * 50)
+        print(f"Study Type: {analysis.study_type.value}")
+        if analysis.hypothesis:
+            print(f"Hypothesis: {analysis.hypothesis}")
+        
+        print("\nKey Findings:")
+        print(f"  Describes identification method: {analysis.describes_identification_method}")
+        if analysis.identification_approach:
+            print(f"    Approach: {analysis.identification_approach}")
+        if analysis.specific_finding_focus:
+            print(f"    Focus: {analysis.specific_finding_focus}")
+        if analysis.performance_described:
+            print(f"    Performance described: {analysis.performance_described}")
+        if analysis.performance_metrics:
+            print(f"    Metrics: {analysis.performance_metrics}")
+        
+        print(f"  Describes communication beyond report: {analysis.describes_communication_beyond_report}")
+        if analysis.communication_recipients:
+            print(f"    Recipients: {analysis.communication_recipients}")
+        if analysis.communication_methods:
+            print(f"    Methods: {analysis.communication_methods}")
+        if analysis.communication_timing:
+            print(f"    Timing: {analysis.communication_timing}")
+        print(f"  Describes tracking system: {analysis.describes_tracking_system}")
+        if analysis.tracking_entry_method:
+            print(f"    Entry method: {analysis.tracking_entry_method.value}")
+        print(f"  Describes completion determination: {analysis.describes_completion_determination}")
+        if analysis.completion_monitoring_method:
+            print(f"    Monitoring method: {analysis.completion_monitoring_method}")
+        if analysis.completion_overdue_actions:
+            print(f"    Overdue actions: {analysis.completion_overdue_actions}")
+        print(f"  Describes ordering assistance: {analysis.describes_ordering_assistance}")
+        if analysis.ordering_assistance_description:
+            print(f"    Assistance description: {analysis.ordering_assistance_description}")
+        if analysis.ordering_automation_level:
+            print(f"    Automation level: {analysis.ordering_automation_level}")
+        print(f"  Describes outcome tracking: {analysis.describes_outcome_tracking}")
+        if analysis.tracked_outcomes:
+            print(f"    Tracked outcomes: {', '.join(analysis.tracked_outcomes)}")
+        print(f"  Describes influencing factors: {analysis.describes_influencing_factors}")
+        if analysis.influencing_factors_description:
+            print(f"    Factors: {analysis.influencing_factors_description}")
+        if analysis.influencing_factor_metrics:
+            print(f"    Metrics: {analysis.influencing_factor_metrics}")
+        
+        print(f"\nConfidence Score: {analysis.confidence_score:.2f}")
+        if analysis.notes:
+            print(f"Notes: {analysis.notes}")
+        
+        logfire.info("Analysis summary printed successfully")
 
 
 if __name__ == "__main__":
     import sys
-    import logfire
 
     logfire.configure()
     logfire.instrument_pydantic_ai()
@@ -622,24 +773,38 @@ if __name__ == "__main__":
 
     async def analyze_single(filename: str):
         # Example: analyze a markdown file from the data/md directory
-        try:
-            analysis = await analyze_article_from_file(filename)
-            print(analysis.model_dump_json(indent=2, exclude_none=True))
+        with logfire.span("main_analyze_single") as span:
+            span.set_attribute("filename", filename)
+            logfire.info("Starting single file analysis from main", filename=filename)
             
-        except FileNotFoundError:
-            print(f"File {filename} not found. Check the path.")
-        except Exception as e:
-            print(f"Error: {e}")
+            try:
+                analysis = await analyze_article_from_file(filename)
+                print(analysis.model_dump_json(indent=2, exclude_none=True))
+                logfire.info("Single file analysis from main completed successfully", filename=filename)
+                
+            except FileNotFoundError:
+                error_msg = f"File {filename} not found. Check the path."
+                logfire.error("File not found in main", filename=filename)
+                print(error_msg)
+            except Exception as e:
+                logfire.error("Error in main single file analysis", filename=filename, error=str(e))
+                print(f"Error: {e}")
 
     async def analyze_multiple(files: List[str]):
         """Analyze multiple files concurrently."""
-        try:
-            results = await batch_analyze_articles(files)
-            for file_path, analysis in results:
-                print(f"\n========== 📄 Analysis for {file_path} ==========")
-                print(analysis.model_dump_json(indent=2, exclude_none=True))
-        except Exception as e:
-            print(f"Error during batch analysis: {e}")
+        with logfire.span("main_analyze_multiple") as span:
+            span.set_attribute("file_count", len(files))
+            logfire.info("Starting multiple file analysis from main", file_count=len(files))
+            
+            try:
+                results = await batch_analyze_articles(files)
+                for file_path, analysis in results:
+                    print(f"\n========== 📄 Analysis for {file_path} ==========")
+                    print(analysis.model_dump_json(indent=2, exclude_none=True))
+                logfire.info("Multiple file analysis from main completed successfully", file_count=len(files))
+            except Exception as e:
+                logfire.error("Error during batch analysis in main", file_count=len(files), error=str(e))
+                print(f"Error during batch analysis: {e}")
     
     if len(sys.argv) < 2:
         print("Usage: python article_analysis.py <path_to_markdown_file>")

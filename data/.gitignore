@@ -2,3 +2,5 @@
 *.json
 *.jsonl
 *.xlsx
+pdfs/*.pdf
+md/*.md

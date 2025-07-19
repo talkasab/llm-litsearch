@@ -1,6 +1,7 @@
 import asyncio
 import os
 from enum import Enum
+from pathlib import Path
 from typing import List, Optional
 
 import logfire
@@ -36,9 +37,10 @@ class RecommendationEntry(str, Enum):
 class BasicAnalysis(BaseModel):
     """Basic yes/no analysis of the article's key features."""
     
-    # Question 1
-    study_type: StudyType = Field(
-        description="Whether the article was descriptive or tested hypotheses"
+    # Question 1 - Hypothesis
+    hypothesis: Optional[str] = Field(
+        default=None,
+        description="The hypothesis or hypotheses of this paper, if any"
     )
     
     # Questions 2-8 (basic yes/no)
@@ -49,7 +51,7 @@ class BasicAnalysis(BaseModel):
         description="Does the article describe how follow-up recommendations were communicated beyond the radiology report?"
     )
     describes_tracking_system: bool = Field(
-        description="Does the article describe follow-up recommendations being entered into a tracking system?"
+        description="Does the article describe a method or methods follow-up recommendations being entered into a tracking system?"
     )
     describes_completion_determination: bool = Field(
         description="Does the article describe how the tracking system determined if a recommendation was completed?"
@@ -72,14 +74,6 @@ class BasicAnalysis(BaseModel):
 
 
 # Individual detail prompts
-HYPOTHESIS_PROMPT = """You previously identified that this article tests at least one hypothesis. 
-
-What was the specific hypothesis tested in this study? Provide the exact hypothesis or describe it as clearly as possible based on the article text in 1-2 sentences."""
-
-class HypothesisDetails(BaseModel):
-    """Details about the hypothesis tested in the study."""
-    hypothesis: str = Field(description="The specific hypothesis tested (1-2 sentences)")
-
 IDENTIFICATION_METHOD_PROMPT = """You previously identified that this article describes a method for identifying follow-up recommendations in radiology reports.
 
 Please provide specific details about the identification method by answering these questions:
@@ -88,14 +82,14 @@ a. How are the recommendations identified? For example, were the recommendations
 
 b. Did this article focus on a particular type of radiology finding and follow up recommendation (such as a pulmonary nodule and recommendation for follow up imaging of the pulmonary nodule), if so, what?
 
-c. Does the article describe how well the method for identifying the follow up recommendation worked (such as sensitivity, specificity, precision, recall, accuracy, and f-score)? If so, describe the performance of the method in identifying follow up recommendations."""
+c. Does the article describe how well the method or methods for identifying the follow up recommendation worked (such as sensitivity, specificity, precision, recall, accuracy, and f-score)? If so, summarize the results of the methods or methods used, including confidence intervals and P values."""
 
 class IdentificationMethodDetails(BaseModel):
     """Details about how follow-up recommendations are identified."""
     identification_approach: str = Field(description="How recommendations are identified (NLP, AI, LLM, manual flagging by radiologists, etc.)")
     specific_finding_focus: Optional[str] = Field(default=None, description="Specific type of radiology finding focused on (e.g., pulmonary nodule, liver lesion), if any")
     performance_described: bool = Field(description="Whether the article describes performance metrics for the identification method")
-    performance_metrics: Optional[str] = Field(default=None, description="Performance metrics reported (sensitivity, specificity, precision, recall, accuracy, f-score, etc.) if described")
+    performance_summary: Optional[str] = Field(default=None, description="Summary of performance results including metrics (sensitivity, specificity, precision, recall, accuracy, f-score), confidence intervals, and P values if described")
 
 COMMUNICATION_PROMPT = """You previously identified that this article describes how follow-up recommendations were communicated beyond the radiology report.
 
@@ -178,7 +172,6 @@ class ArticleAnalysis(BaseModel):
     """Complete structured analysis of a radiology follow-up recommendation article."""
     
     # Basic findings (always present)
-    study_type: StudyType = Field(description="Whether the article was descriptive or tested hypotheses")
     describes_identification_method: bool = Field(description="Does the article describe a method for identifying follow-up recommendations?")
     describes_communication_beyond_report: bool = Field(description="Does the article describe communication beyond reports?")
     describes_tracking_system: bool = Field(description="Does the article describe a tracking system?")
@@ -188,11 +181,11 @@ class ArticleAnalysis(BaseModel):
     describes_influencing_factors: bool = Field(description="Does the article describe influencing factors?")
     
     # Detailed findings (only present if relevant)
-    hypothesis: Optional[str] = Field(default=None, description="The hypothesis tested, if applicable")
+    hypothesis: Optional[str] = Field(default=None, description="The hypothesis or hypotheses of this paper, if any")
     identification_approach: Optional[str] = Field(default=None, description="How recommendations are identified")
     specific_finding_focus: Optional[str] = Field(default=None, description="Specific type of radiology finding focused on")
     performance_described: Optional[bool] = Field(default=None, description="Whether performance metrics are described")
-    performance_metrics: Optional[str] = Field(default=None, description="Performance metrics reported")
+    performance_metrics: Optional[str] = Field(default=None, description="Summary of performance results including metrics, confidence intervals, and P values")
     communication_recipients: Optional[str] = Field(default=None, description="Who received communication about follow-up recommendations")
     communication_methods: Optional[str] = Field(default=None, description="How recommendations were communicated")
     communication_timing: Optional[str] = Field(default=None, description="When communication occurred")
@@ -225,11 +218,11 @@ Analyze the article carefully and provide structured responses to specific quest
 
 If information is not clearly stated in the article, indicate this rather than making assumptions."""
 
-BASIC_ANALYSIS_PROMPT = """Analyze this article and answer the following basic questions with yes/no responses:
+BASIC_ANALYSIS_PROMPT = """Analyze this article and answer the following questions:
 
-1. Was this article descriptive or did it test at least one hypothesis?
+1. What was the hypothesis or hypotheses of this paper? (If the paper doesn't have explicit hypotheses, leave this blank)
 
-2. Does this article describe a method for identifying follow-up recommendations in radiology reports?
+2. Does this article describe a method or methods for identifying follow-up recommendations in radiology reports?
 
 3. Does this article describe how the existence of follow-up recommendations was communicated beyond its inclusion in the radiology report?
 
@@ -246,11 +239,7 @@ BASIC_ANALYSIS_PROMPT = """Analyze this article and answer the following basic q
 Provide a confidence score based on how clearly the article addresses these questions."""
 
 # Individual detail prompts
-HYPOTHESIS_PROMPT = """You previously identified that this article tests at least one hypothesis. 
-
-What was the specific hypothesis tested in this study? Provide the exact hypothesis or describe it as clearly as possible based on the article text in 1-2 sentences."""
-
-IDENTIFICATION_METHOD_PROMPT = """You previously identified that this article describes a method for identifying follow-up recommendations in radiology reports.
+IDENTIFICATION_METHOD_PROMPT = """You previously identified that this article describes a method or methods for identifying follow-up recommendations in radiology reports.
 
 What are the specific details about how follow-up recommendations were identified? Describe the method, technology, or process used."""
 
@@ -271,6 +260,87 @@ What specific assistance was provided for ordering/scheduling recommended follow
 OUTCOME_TRACKING_PROMPT = """You previously identified that this article describes tracking of outcomes associated with exams performed as a result of recommendations.
 
 What specific outcomes were tracked for the exams performed as a result of the recommendations? List all outcomes mentioned."""
+
+
+def filter_article_sections(article_text: str) -> str:
+    """
+    Filter out introduction and discussion sections from the article text.
+    
+    Args:
+        article_text: The full text of the article
+        
+    Returns:
+        str: Filtered article text with introduction and discussion sections removed
+    """
+    with logfire.span("filter_article_sections") as span:
+        original_length = len(article_text)
+        logfire.info("Starting article section filtering", original_length=original_length)
+        
+        # Convert to lowercase for case-insensitive matching
+        lines = article_text.split('\n')
+        lines_lower = [line.lower() for line in lines]
+        
+        # Common section headers to remove (introduction and discussion/conclusion)
+        remove_sections = [
+            'introduction', 'background', 'literature review',
+            'discussion', 'conclusion', 'conclusions', 'limitations',
+            'future work', 'future directions', 'acknowledgments', 'acknowledgements',
+            'references', 'bibliography', 'conflict of interest', 'funding',
+            'author contributions', 'ethics', 'consent'
+        ]
+        
+        filtered_lines = []
+        skip_section = False
+        current_section = None
+        
+        for i, (line, line_lower) in enumerate(zip(lines, lines_lower)):
+            # Check if this line is a section header
+            stripped_line = line_lower.strip()
+            
+            # Common markdown/academic paper section patterns
+            is_section_header = (
+                # Markdown headers (# ## ###)
+                stripped_line.startswith('#') or
+                # Numbered sections (1. 2. 3.)
+                (len(stripped_line) > 0 and stripped_line[0].isdigit() and '.' in stripped_line[:5]) or
+                # All caps headers
+                (len(stripped_line) > 2 and stripped_line.isupper() and not any(char.isdigit() for char in stripped_line))
+            )
+            
+            if is_section_header:
+                # Check if this section should be removed
+                section_should_be_removed = any(
+                    remove_word in stripped_line for remove_word in remove_sections
+                )
+                
+                if section_should_be_removed:
+                    skip_section = True
+                    current_section = stripped_line
+                    logfire.debug("Skipping section", section=current_section)
+                    continue
+                else:
+                    # This is a section we want to keep
+                    skip_section = False
+                    current_section = stripped_line
+                    logfire.debug("Keeping section", section=current_section)
+            
+            # Add line if we're not skipping this section
+            if not skip_section:
+                filtered_lines.append(line)
+        
+        filtered_text = '\n'.join(filtered_lines)
+        filtered_length = len(filtered_text)
+        
+        logfire.info("Article section filtering completed", 
+                    original_length=original_length,
+                    filtered_length=filtered_length,
+                    reduction_percent=round((1 - filtered_length/original_length) * 100, 1) if original_length > 0 else 0)
+        
+        span.set_attribute("original_length", original_length)
+        span.set_attribute("filtered_length", filtered_length)
+        span.set_attribute("reduction_percent", round((1 - filtered_length/original_length) * 100, 1) if original_length > 0 else 0)
+        
+        return filtered_text
 
 
 def check_api_configuration() -> bool:
@@ -350,6 +420,10 @@ async def analyze_article(article_text: str) -> ArticleAnalysis:
             model_name = os.getenv("OPENAI_MODEL", "openai:gpt-4o")
             logfire.info("Using model for analysis", model=model_name)
             
+            # Filter out introduction and discussion sections before analysis
+            logfire.info("Filtering article sections before analysis")
+            filtered_article_text = filter_article_sections(article_text)
+            
             # Create a single agent that can handle multiple response types
             agent = Agent(
                 model=model_name,
@@ -373,7 +447,7 @@ async def analyze_article(article_text: str) -> ArticleAnalysis:
                 {BASIC_ANALYSIS_PROMPT}
 
                 Article text:
-                {article_text}""",
+                {filtered_article_text}""",
                 output_type=BasicAnalysis,
                 usage=total_usage
             )
@@ -382,8 +456,8 @@ async def analyze_article(article_text: str) -> ArticleAnalysis:
             message_history = conversation.all_messages()
             
             logfire.info("Basic analysis completed", 
-                        study_type=basic_analysis.study_type.value,
                         confidence_score=basic_analysis.confidence_score,
+                        has_hypothesis=bool(basic_analysis.hypothesis),
                         identifies_method=basic_analysis.describes_identification_method,
                         has_communication=basic_analysis.describes_communication_beyond_report,
                         has_tracking=basic_analysis.describes_tracking_system,
@@ -394,7 +468,7 @@ async def analyze_article(article_text: str) -> ArticleAnalysis:
             
             # Initialize the final analysis with basic results
             final_analysis = ArticleAnalysis(
-                study_type=basic_analysis.study_type,
+                hypothesis=basic_analysis.hypothesis,  # Use hypothesis from basic analysis
                 describes_identification_method=basic_analysis.describes_identification_method,
                 describes_communication_beyond_report=basic_analysis.describes_communication_beyond_report,
                 describes_tracking_system=basic_analysis.describes_tracking_system,
@@ -411,20 +485,7 @@ async def analyze_article(article_text: str) -> ArticleAnalysis:
             # Continue the conversation for detailed questions (only if relevant)
             detailed_analyses_count = 0
             
-            # Get hypothesis details if it's a hypothesis-testing study
-            if basic_analysis.study_type == StudyType.HYPOTHESIS_TESTING:
-                logfire.info("Running hypothesis analysis")
-                with logfire.span("hypothesis_analysis"):
-                    hypothesis_result = await agent.run(
-                        HYPOTHESIS_PROMPT,
-                        output_type=HypothesisDetails,
-                        message_history=message_history,
-                        usage=total_usage
-                    )
-                    final_analysis.hypothesis = hypothesis_result.output.hypothesis
-                    message_history = hypothesis_result.all_messages()
-                    detailed_analyses_count += 1
-                    logfire.info("Hypothesis analysis completed", hypothesis=final_analysis.hypothesis)
+            # Note: Hypothesis is now captured in basic analysis, no separate call needed
             
             # Get identification method details
             if basic_analysis.describes_identification_method:
@@ -439,7 +500,7 @@ async def analyze_article(article_text: str) -> ArticleAnalysis:
                     final_analysis.identification_approach = identification_result.output.identification_approach
                     final_analysis.specific_finding_focus = identification_result.output.specific_finding_focus
                     final_analysis.performance_described = identification_result.output.performance_described
-                    final_analysis.performance_metrics = identification_result.output.performance_metrics
+                    final_analysis.performance_metrics = identification_result.output.performance_summary
                     message_history = identification_result.all_messages()
                     detailed_analyses_count += 1
                     logfire.info("Identification method analysis completed", 
@@ -610,7 +671,7 @@ async def analyze_article_from_file(file_path: str) -> ArticleAnalysis:
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", 1))
 DEFAULT_RETRIES = int(os.getenv("DEFAULT_RETRIES", 3))
 
-async def batch_analyze_articles(file_paths: List[str]) -> List[tuple[str, ArticleAnalysis]]:
+async def batch_analyze_articles(file_paths: List[str], output_dir: str | None = None, skip_if_exists: bool = False) -> List[tuple[str, ArticleAnalysis | None]]:
     """
     Analyze multiple articles in batch.
     
@@ -620,26 +681,45 @@ async def batch_analyze_articles(file_paths: List[str]) -> List[tuple[str, Artic
     Returns:
         List of tuples containing (file_path, analysis_result)
     """
+    output_path = Path(output_dir) if isinstance(output_dir, str) else None
     with logfire.span("batch_analyze_articles") as span:
         span.set_attribute("file_count", len(file_paths))
-        logfire.info("Starting batch analysis", file_count=len(file_paths), max_concurrent=MAX_CONCURRENT_REQUESTS)
-        
-        async def analyze_single(file_path: str, semaphore: asyncio.Semaphore) -> tuple[str, ArticleAnalysis]:
+        logfire.info("Starting batch analysis", file_count=len(file_paths), max_concurrent=MAX_CONCURRENT_REQUESTS, output_dir=output_dir)
+        if output_dir is None:
+            logfire.warning("No output directory specified, results will not be saved to files")
+        skipped_files = []
+        errors = []
+        async def analyze_single(file_path: str, semaphore: asyncio.Semaphore, output_path: Path | None) -> tuple[str, ArticleAnalysis | None]:
+            # Get the name of the output file we'd send this to
+            if output_path:
+                output_file = Path(output_path) / f"{Path(file_path).stem}_analysis.json"
+            else:
+                output_file = None
+                logfire.info("No output file specified for analysis", file_path=file_path)
+            if skip_if_exists and output_file and output_file.exists():
+                logfire.info("Skipping analysis for existing file", file_path=file_path, output_file=output_file)
+                skipped_files.append(file_path)
+                return (file_path, None)
             async with semaphore:
                 with logfire.span("batch_analyze_single", file_path=file_path):
                     try:
                         logfire.info("Starting single file analysis in batch", file_path=file_path)
                         analysis = await analyze_article_from_file(file_path)
                         logfire.info("Completed single file analysis in batch", file_path=file_path)
+                        if output_file:
+                            # Save the analysis to the output file
+                            logfire.info("Saving analysis to output file", output_file=output_file)
+                            save_batch_results_to_json([(file_path, analysis)], str(output_file))
                         return (file_path, analysis)
                     except Exception as e:
                         logfire.error("Error analyzing file in batch", file_path=file_path, error=str(e))
                         print(f"Error analyzing {file_path}: {e}")
-                        raise
-        
+                        errors.append((file_path, str(e)))
+                        return (file_path, None)
+
         # Process articles concurrently (be mindful of API rate limits)
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-        tasks = [analyze_single(path, semaphore) for path in file_paths]
+        tasks = [analyze_single(path, semaphore, output_path) for path in file_paths]
         
         try:
             results = await asyncio.gather(*tasks)
@@ -705,15 +785,14 @@ def save_batch_results_to_json(results: List[tuple[str, ArticleAnalysis]], outpu
 def print_analysis_summary(analysis: ArticleAnalysis) -> None:
     """Print a human-readable summary of the analysis results."""
     with logfire.span("print_analysis_summary") as span:
-        span.set_attribute("study_type", analysis.study_type.value)
         span.set_attribute("confidence_score", analysis.confidence_score)
+        span.set_attribute("has_hypothesis", bool(analysis.hypothesis))
         logfire.info("Printing analysis summary", 
-                    study_type=analysis.study_type.value,
-                    confidence_score=analysis.confidence_score)
+                    confidence_score=analysis.confidence_score,
+                    has_hypothesis=bool(analysis.hypothesis))
         
         print("Article Analysis Summary")
         print("=" * 50)
-        print(f"Study Type: {analysis.study_type.value}")
         if analysis.hypothesis:
             print(f"Hypothesis: {analysis.hypothesis}")
         
@@ -797,10 +876,15 @@ if __name__ == "__main__":
             logfire.info("Starting multiple file analysis from main", file_count=len(files))
             
             try:
-                results = await batch_analyze_articles(files)
+                output_dir = os.getenv("OUTPUT_DIR", None)
+                skip_if_exists = os.getenv("SKIP_IF_EXISTS", "true").lower() == "true" if output_dir else False
+                results = await batch_analyze_articles(files, output_dir=output_dir, skip_if_exists=skip_if_exists)
                 for file_path, analysis in results:
                     print(f"\n========== 📄 Analysis for {file_path} ==========")
-                    print(analysis.model_dump_json(indent=2, exclude_none=True))
+                    if analysis:
+                        print(analysis.model_dump_json(indent=2, exclude_none=True))
+                    else:
+                        print(f"No analysis available for {file_path} (skipped or failed)")
                 logfire.info("Multiple file analysis from main completed successfully", file_count=len(files))
             except Exception as e:
                 logfire.error("Error during batch analysis in main", file_count=len(files), error=str(e))
